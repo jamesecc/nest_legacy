@@ -298,6 +298,19 @@ _DUAL_FUEL_OVERRIDE_MAP: dict[
     ),
 }
 
+# Read-only traits that report live device state rather than a user setting.
+# The observe stream can carry an ACCEPTED (pending/desired) state alongside the
+# CONFIRMED (device reported) one, and the gateway replays the ACCEPTED state in
+# every snapshot. Preferring ACCEPTED gives snappy optimistic updates for
+# settings traits we write ourselves, but for these traits it lets a stale
+# pending state permanently mask what the device actually reports, e.g. the Heat
+# Link's HotWaterTrait.boilerActive staying on after a hot water boost ends.
+_CONFIRMED_STATE_TRAITS: frozenset[str] = frozenset(
+    {
+        nest_hvac_pb2.HotWaterTrait.DESCRIPTOR.full_name,
+    }
+)
+
 _USER_AGENT = "Nest/5.87.0 (iOScom.nestlabs.jasper.release) os=26.4"
 
 _NEST_ENVIRONMENTS: dict[str, NestEnvironment] = {
@@ -511,6 +524,7 @@ class NestClient:
         self._raw_data: dict[str, Any] = {}
         self._buckets_for_subscription: list[Bucket] = []
         self._resource_types: dict[str, str] = {}
+        self._confirmed_states_seen: set[tuple[str, str]] = set()
         self._legacy_protobuf_events_warned: bool = False
         self._protobuf_events_unauthorized: set[str] = set()
         # Collisions do not change between polls, so each one is only reported
@@ -2662,6 +2676,22 @@ class NestClient:
                 )
             ):
                 updates[resource_id][trait_label] = unpacked_message
+
+            # Read-only device state: CONFIRMED is what the device actually
+            # reports, so a pending ACCEPTED state must never mask it.
+            if descriptor_full_name in _CONFIRMED_STATE_TRAITS:
+                seen_key = (resource_id, descriptor_full_name)
+                if v2_pb2.CONFIRMED in state.stateTypes:
+                    self._confirmed_states_seen.add(seen_key)
+                elif seen_key in self._confirmed_states_seen:
+                    _LOGGER.debug(
+                        "Ignoring pending state for read-only trait %s on %s",
+                        descriptor_full_name,
+                        resource_id,
+                    )
+                    continue
+                updates[resource_id][descriptor_full_name] = unpacked_message
+                continue
 
             # Prioritize ACCEPTED over CONFIRMED.
             # If we already have data for this trait in this batch,
