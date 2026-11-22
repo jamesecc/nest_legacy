@@ -82,6 +82,12 @@ class NestProtect(NestDevice):
     last_audio_self_test_end_utc_secs: int = 0
     ntp_green_led_enable: bool = False
     heads_up_enable: bool = False
+    # Only reported by the legacy REST API; None when the device is read over
+    # protobuf, so the matching entities are not created there.
+    hushed_state: bool | None = None
+    co_previous_peak: int | None = None
+    component_als_test_passed: bool | None = None
+    component_temp_test_passed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -123,8 +129,9 @@ class NestThermostat(NestDevice):
     target_humidity: float | None = None
     hvac_state: ThermostatHvacState = ThermostatHvacState.OFF
     hvac_mode: ThermostatHvacMode = ThermostatHvacMode.OFF
-    # Which stage the equipment is running, OFF when idle.
-    hvac_stage: ThermostatHvacStage = ThermostatHvacStage.OFF
+    # Which stage the equipment is running, OFF when idle. None on the legacy
+    # API, which reports heating/cooling without the stage.
+    hvac_stage: ThermostatHvacStage | None = None
     is_eco_mode: bool = False
     can_heat: bool = False
     can_cool: bool = False
@@ -246,6 +253,10 @@ class NestStructure(NestDevice):
     """Represents a Nest Structure (i.e., a home)."""
 
     mode: StructureMode = StructureMode.HOME
+    # Safety summary across the structure's Protects (legacy REST API only).
+    # None when the structure has no Protect.
+    safety_critical_failures: int | None = None
+    safety_warnings: int | None = None
 
 
 @dataclass(frozen=True)
@@ -428,7 +439,13 @@ class NestAuthResponse:
     jwt: str | None = None
     claims: NestAuthClaims | dict[str, Any] | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Handle nested dataclass."""
         if self.claims and isinstance(self.claims, dict):
             self.claims = NestAuthClaims.from_dict(self.claims)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> NestAuthResponse:
+        """Create an instance from a dict, ignoring unknown keys."""
+        known_fields = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known_fields})

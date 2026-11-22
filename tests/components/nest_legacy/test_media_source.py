@@ -4,6 +4,7 @@ from http import HTTPStatus
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from aiohttp import ClientError
 from custom_components.nest_legacy.const import DOMAIN
 from custom_components.nest_legacy.pynest.exceptions import PynestException
 import pytest
@@ -18,8 +19,8 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.setup import async_setup_component
 
-from pytest_homeassistant_custom_component.common import MockConfigEntry
-from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
+from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.typing import ClientSessionGenerator
 
 CAMERA_SERIAL = "18B430CCCCCC0002"
 
@@ -294,4 +295,41 @@ async def test_clip_view_reports_an_api_failure(
         f"/{CAMERA_SERIAL}/event-1/clip"
     )
 
+    assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+@pytest.mark.usefixtures("media_views")
+async def test_media_source_handles_client_errors_and_malformed_paths(
+    hass: HomeAssistant,
+    hass_client: ClientSessionGenerator,
+    init_integration: MockConfigEntry,
+    mock_nest_client: AsyncMock,
+) -> None:
+    """Network errors and invalid dates/pages raise clean errors instead of 500 tracebacks."""
+    with pytest.raises(Unresolvable):
+        await async_browse_media(
+            hass,
+            f"{URI_SCHEME}{DOMAIN}/{init_integration.entry_id}/{CAMERA_SERIAL}/not-a-date",
+        )
+    with pytest.raises(Unresolvable):
+        await async_browse_media(
+            hass,
+            f"{URI_SCHEME}{DOMAIN}/{init_integration.entry_id}/{CAMERA_SERIAL}/{DAY}/all/not-an-int",
+        )
+
+    mock_nest_client.async_get_camera_events.side_effect = ClientError("network down")
+    with pytest.raises(Unresolvable):
+        await async_browse_media(
+            hass,
+            f"{URI_SCHEME}{DOMAIN}/{init_integration.entry_id}/{CAMERA_SERIAL}/{DAY}/all",
+        )
+
+    mock_nest_client.async_get_camera_event_media_stream = MagicMock(
+        side_effect=TimeoutError
+    )
+    client = await hass_client()
+    response = await client.get(
+        f"/api/nest_legacy/event_media/{init_integration.entry_id}"
+        f"/{CAMERA_SERIAL}/event-1/thumbnail"
+    )
     assert response.status == HTTPStatus.INTERNAL_SERVER_ERROR

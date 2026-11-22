@@ -33,17 +33,14 @@ from homeassistant.components.climate import (
 )
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_TEMPERATURE, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util.unit_system import METRIC_SYSTEM, US_CUSTOMARY_SYSTEM
 
 from . import setup_integration
 from .const import THERMOSTAT_KEY, THERMOSTAT_SERIAL
 
-from pytest_homeassistant_custom_component.common import (
-    MockConfigEntry,
-    snapshot_platform,
-)
+from pytest_homeassistant.common import MockConfigEntry, snapshot_platform
 
 ENTITY_ID = "climate.hallway_hallway_upstairs"
 
@@ -342,6 +339,20 @@ async def test_set_fan_timer(
     assert data["fan_timer_timeout"] > 0
 
 
+async def test_set_fan_timer_rejects_non_positive_duration(
+    hass: HomeAssistant,
+    init_integration: MockConfigEntry,
+) -> None:
+    """A zero or negative fan timer duration raises ServiceValidationError."""
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(
+            DOMAIN,
+            "set_fan_timer",
+            {ATTR_ENTITY_ID: ENTITY_ID, "duration": {"minutes": 0}},
+            blocking=True,
+        )
+
+
 async def test_set_fan_timer_without_fan(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,
@@ -382,3 +393,21 @@ async def test_command_failure_raises(
         )
 
     assert err.value.translation_key == "set_data_failed"
+
+
+async def test_no_deprecated_temperature_members(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_nest_client: AsyncMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Setting up and controlling climate emits no temperature deprecation warnings."""
+    await setup_integration(hass, mock_config_entry)
+    await hass.services.async_call(
+        CLIMATE_DOMAIN,
+        SERVICE_SET_TEMPERATURE,
+        {ATTR_ENTITY_ID: ENTITY_ID, ATTR_TEMPERATURE: 21},
+        blocking=True,
+    )
+
+    assert "deprecated" not in caplog.text.lower()

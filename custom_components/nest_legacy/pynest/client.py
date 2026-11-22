@@ -84,6 +84,16 @@ from .protobuf_gen.weave.trait import (
     security_pb2 as weave_security_pb2,
 )
 
+# A camera answers a snapshot request with the frame it had already uploaded:
+# upload_live_image is handled asynchronously, so a GET sent right after it
+# returns the image from before the request. The camera publishes the URL of the
+# new upload through the trait stream about a second later, so wait for that
+# update and read the URL it carries instead of guessing a delay. Measured
+# against a live camera: the trait arrives in 0.9-1.3 s, the download takes 0.1 s.
+_SNAPSHOT_URL_TIMEOUT = 2.0
+_SNAPSHOT_ATTEMPTS = 3
+_SNAPSHOT_RETRY_DELAY = 1.0
+
 _NON_RETRYABLE_CODES = frozenset(
     {
         3,  # INVALID_ARGUMENT: Client specified an invalid argument.
@@ -342,28 +352,33 @@ _BATCH_UPDATE_ENDPOINT = "/nestlabs.gateway.v1.TraitBatchApi/BatchUpdateState"
 
 _NESTLABS_TYPE_URL_PREFIX = "type.nestlabs.com/"
 
-# Thermostats, temperature sensors and Heat Links are read over protobuf, so
-# their buckets (device, shared, kryptonite, link, track, rcs_settings,
-# demand_response, tuneups) are not requested.
 _NEST_REQUEST: dict[str, Any] = {
     "known_bucket_types": [
         BucketType.BUCKETS,
         BucketType.DELAYED_TOPAZ,
+        BucketType.DEMAND_RESPONSE,
+        BucketType.DEVICE,
         BucketType.DEVICE_ALERT_DIALOG,
         BucketType.GEOFENCE_INFO,
+        BucketType.KRYPTONITE,
+        BucketType.LINK,
         BucketType.MESSAGE,
         BucketType.MESSAGE_CENTER,
         BucketType.METADATA,
         BucketType.OCCUPANCY,
         BucketType.QUARTZ,
         BucketType.SAFETY,
+        BucketType.RCS_SETTINGS,
         BucketType.SAFETY_SUMMARY,
         BucketType.SCHEDULE,
+        BucketType.SHARED,
         BucketType.STRUCTURE,
         BucketType.STRUCTURE_METADATA,
         BucketType.TOPAZ,
         BucketType.TOPAZ_RESOURCE,
+        BucketType.TRACK,
         BucketType.TRIP,
+        BucketType.TUNEUPS,
         BucketType.USER,
         BucketType.USER_SETTINGS,
         BucketType.WHERE,
@@ -415,7 +430,9 @@ def _raise_for_status_code(status_code: int, msg: str) -> NoReturn:
         raise NotAuthenticatedException(msg)
     # Nest answers PERMISSION_DENIED with "authentication failed" for a stale
     # session (see issue #81), but also for a trait the account can never
-    # access (see issue #61).
+    # access (see issue #61). The message cannot tell them apart, so the caller
+    # refreshes the session and retries; only a failure that survives that is
+    # worth pausing the camera for (see the coordinator's event poll).
     if status_code == 7 and "authenticat" in msg.lower():
         raise AuthenticationFailedException(msg)
     if status_code in _NON_RETRYABLE_CODES:
@@ -526,7 +543,10 @@ class NestClient:
         self._resource_types: dict[str, str] = {}
         self._confirmed_states_seen: set[tuple[str, str]] = set()
         self._legacy_protobuf_events_warned: bool = False
-        self._protobuf_events_unauthorized: set[str] = set()
+        # Latest liveImageUrl published by each camera's trait stream, and one
+        # waiter per camera for the snapshot code to know when it changed.
+        self._live_image_urls: dict[str, str] = {}
+        self._live_image_waiters: dict[str, asyncio.Event] = {}
         # Collisions do not change between polls, so each one is only reported
         # once for the lifetime of the client.
         self._trait_label_collisions_warned: set[tuple[str, str]] = set()
@@ -538,8 +558,9 @@ class NestClient:
         # Build set of traits to observe based on flags
         self._observe_traits: set[type[Message]] = set()
         self._observe_traits.update(_OBSERVER_ALWAYS_INCLUDE_TRAITS)
-        # Locks, thermostats, temperature sensors and Heat Links are only
-        # ever read over protobuf, so their traits are unconditional.
+        # Lock and thermostat traits (including temperature sensors and Heat
+        # Links) are always observed; thermostats not exposed over protobuf
+        # fall back to their REST buckets in the parser.
         self._observe_traits.update(_OBSERVE_LOCK_TRAITS)
         self._observe_traits.update(_OBSERVE_THERMOSTAT_TRAITS)
         if enable_protobuf_protect:
@@ -619,9 +640,32 @@ class NestClient:
             )
             if rotated:
                 _LOGGER.debug("Google rotated cookies: %s", ", ".join(rotated))
-            result = await response.json()
+            if not response.ok and _is_transient_status(response.status):
+                body = await response.text()
+                message = f"Failed to get Google access token: {response.status}"
+                _LOGGER.info(
+                    "Transient error getting Google access token, will retry. "
+                    "Status: %s, Body: %s",
+                    response.status,
+                    body,
+                )
+                raise _transient_exception(response.status, message)
+            try:
+                result = await response.json()
+            except ContentTypeError as err:
+                raise BadCredentialsException(
+                    f"Failed to get Google access token: {response.status}"
+                ) from err
+            if not isinstance(result, dict):
+                raise BadCredentialsException(
+                    "Invalid response from Google token endpoint"
+                )
             if "error" in result:
                 raise BadCredentialsException(result.get("detail", result["error"]))
+            if not response.ok:
+                raise BadCredentialsException(
+                    f"Failed to get Google access token: {response.status}"
+                )
             return GoogleAuthResponse.from_dict(result)
 
     async def _async_authenticate(self, access_token: str) -> NestSession:
@@ -645,8 +689,46 @@ class NestClient:
                 "Referer": f"https://{self._environment.host}",
             },
         ) as response:
-            result = await response.json()
-            nest_auth = NestAuthResponse(**result)
+            if not response.ok and _is_transient_status(response.status):
+                body = await response.text()
+                message = f"Failed to get Nest JWT: {response.status}"
+                _LOGGER.info(
+                    "Transient error getting Nest JWT, will retry. "
+                    "Status: %s, Body: %s",
+                    response.status,
+                    body,
+                )
+                raise _transient_exception(response.status, message)
+            try:
+                result = await response.json()
+            except ContentTypeError as err:
+                raise BadCredentialsException(
+                    f"Failed to get Nest JWT: {response.status}"
+                ) from err
+            if not isinstance(result, dict):
+                raise BadCredentialsException("Invalid response from Nest JWT endpoint")
+            if "error" in result:
+                error = result["error"]
+                if (
+                    isinstance(error, dict)
+                    and isinstance(status := error.get("code"), int)
+                    and _is_transient_status(status)
+                ):
+                    raise _transient_exception(
+                        status,
+                        str(error.get("message", f"Failed to get Nest JWT: {status}")),
+                    )
+                message = (
+                    str(error.get("message", error))
+                    if isinstance(error, dict)
+                    else str(error)
+                )
+                raise BadCredentialsException(message)
+            if not response.ok:
+                raise BadCredentialsException(
+                    f"Failed to get Nest JWT: {response.status}"
+                )
+            nest_auth = NestAuthResponse.from_dict(result)
             if not nest_auth.jwt:
                 raise BadCredentialsException("Could not get JWT from Google token")
             return await self._async_get_session(nest_auth.jwt)
@@ -779,19 +861,7 @@ class NestClient:
 
     def _filter_buckets(self, buckets: list[Bucket]) -> list[Bucket]:
         """Filter buckets based on enabled protobuf features."""
-        # Thermostats, temperature sensors and Heat Links are read over
-        # protobuf. Their buckets are not requested, but drop them in case the
-        # server sends them anyway.
-        excluded_keys = {
-            BucketType.DEVICE,
-            BucketType.SHARED,
-            BucketType.KRYPTONITE,
-            BucketType.LINK,
-            BucketType.TRACK,
-            BucketType.RCS_SETTINGS,
-            BucketType.DEMAND_RESPONSE,
-            BucketType.TUNEUPS,
-        }
+        excluded_keys: set[BucketType] = set()
 
         if self._enable_protobuf_protect:
             excluded_keys.update(
@@ -974,6 +1044,48 @@ class NestClient:
             else:
                 return
 
+    async def _async_set_thermostat_property(
+        self, object_key: str, data: dict[str, Any]
+    ) -> None:
+        """Set properties for a thermostat."""
+        device_id = object_key.split(".")[1]
+        data = data.copy()
+
+        # Translate generic 'hvac_mode' key to legacy API's 'target_temperature_type'
+        if "hvac_mode" in data:
+            data["target_temperature_type"] = data.pop("hvac_mode")
+
+        # Translate semantic exit_eco flag to legacy REST eco payload
+        if data.pop("exit_eco", None):
+            data["eco"] = {"mode": "schedule"}
+
+        shared_properties = {
+            "target_temperature",
+            "target_temperature_low",
+            "target_temperature_high",
+            "target_temperature_type",
+        }
+        shared_payload = {k: v for k, v in data.items() if k in shared_properties}
+        device_payload = {k: v for k, v in data.items() if k not in shared_properties}
+
+        objects_to_update = []
+        if shared_payload:
+            shared_payload["target_change_pending"] = True
+            objects_to_update.append(
+                {
+                    "object_key": f"shared.{device_id}",
+                    "op": "MERGE",
+                    "value": shared_payload,
+                }
+            )
+        if device_payload:
+            objects_to_update.append(
+                {"object_key": object_key, "op": "MERGE", "value": device_payload}
+            )
+
+        if objects_to_update:
+            await self._async_update_objects(objects_to_update)
+
     async def _async_set_generic_property(
         self, object_key: str, data: dict[str, Any]
     ) -> None:
@@ -989,6 +1101,45 @@ class NestClient:
         current_traits: dict[str, Any] | None = None,
     ) -> None:
         """Set properties for a Heat Link."""
+        if (
+            device.associated_thermostat_object_key
+            and "DEVICE_" in device.associated_thermostat_object_key
+        ):
+            await self._async_set_protobuf_heatlink_property(
+                device, data, current_traits
+            )
+            return
+
+        if not device.associated_thermostat_object_key:
+            return
+
+        payload = data.copy()
+
+        # Legacy API does not support hot_water_mode directly
+        payload.pop("hot_water_mode", None)
+
+        if "hot_water_boost" in payload:
+            duration_seconds = payload.pop("hot_water_boost_duration", 1800)
+            is_boost = payload.pop("hot_water_boost")
+            if is_boost:
+                end_timestamp = int(time.time()) + duration_seconds
+            else:
+                end_timestamp = 0
+            payload["hot_water_boost_time_to_end"] = end_timestamp
+            payload["hot_water_active"] = is_boost
+
+        if payload:
+            await self._async_set_generic_property(
+                device.associated_thermostat_object_key, payload
+            )
+
+    async def _async_set_protobuf_heatlink_property(
+        self,
+        device: NestHeatLink,
+        data: dict[str, Any],
+        current_traits: dict[str, Any] | None = None,
+    ) -> None:
+        """Set properties for a Heat Link via Protobuf."""
         if not device.associated_thermostat_object_key:
             return
 
@@ -1959,14 +2110,16 @@ class NestClient:
         )
         await self._async_update_trait_state(req)
 
-    async def _async_set_thermostat_property(
+    async def _async_set_protobuf_thermostat_property(
         self,
         device: NestThermostat,
         data: dict[str, Any],
         current_traits: dict[str, Any] | None = None,
     ) -> None:
-        """Set properties for a Nest Thermostat."""
-        _LOGGER.debug("Setting thermostat property for %s: %s", device.object_key, data)
+        """Set properties for a protobuf-enabled Nest Thermostat."""
+        _LOGGER.debug(
+            "Setting protobuf thermostat property for %s: %s", device.object_key, data
+        )
 
         now = Timestamp()
         now.GetCurrentTime()
@@ -2149,7 +2302,12 @@ class NestClient:
         elif isinstance(device, NestHeatLink):
             await self._async_set_heatlink_property(device, data, current_traits)
         elif isinstance(device, NestThermostat):
-            await self._async_set_thermostat_property(device, data, current_traits)
+            if device.is_protobuf:
+                await self._async_set_protobuf_thermostat_property(
+                    device, data, current_traits
+                )
+            else:
+                await self._async_set_thermostat_property(device.object_key, data)
         elif isinstance(device, NestStructure):
             await self._async_set_structure_property(device, data)
         elif isinstance(device, NestLock):
@@ -2166,6 +2324,8 @@ class NestClient:
                 await self._async_set_sensor_active(
                     device, data["is_active_sensor"], current_traits
                 )
+            else:
+                await self._async_set_generic_property(device.object_key, data)
         else:
             await self._async_set_generic_property(device.object_key, data)
 
@@ -2176,6 +2336,24 @@ class NestClient:
         current_traits: dict[str, Any] | None = None,
     ) -> None:
         """Set a temperature sensor as the active sensor for its thermostat."""
+        if not device.associated_thermostat_object_key:
+            _LOGGER.warning(
+                "Sensor %s is not associated with any thermostat", device.name
+            )
+            return
+
+        if device.associated_thermostat_object_key.startswith("DEVICE_"):
+            await self._async_set_protobuf_sensor_active(device, active, current_traits)
+        else:
+            await self._async_set_legacy_sensor_active(device, active)
+
+    async def _async_set_protobuf_sensor_active(
+        self,
+        device: NestTempSensor,
+        active: bool,
+        current_traits: dict[str, Any] | None = None,
+    ) -> None:
+        """Set active sensor via Protobuf."""
         # We need the current RCS trait to ensure we don't wipe other settings
         # The RCS trait lives on the Thermostat (associated_thermostat_object_key)
         thermostat_key = device.associated_thermostat_object_key
@@ -2223,8 +2401,43 @@ class NestClient:
         )
         await self._async_update_trait_state(req)
 
+    async def _async_set_legacy_sensor_active(
+        self, device: NestTempSensor, active: bool
+    ) -> None:
+        """Set active sensor via Legacy API."""
+        # For legacy, the key is usually device.<serial>, but rcs_settings uses the serial directly
+        # rcs_settings.<serial>
+        thermostat_key = device.associated_thermostat_object_key
+        if not thermostat_key:
+            _LOGGER.warning(
+                "Sensor %s is not associated with any thermostat", device.name
+            )
+            return
+        device_id = thermostat_key.split(".")[1]
+        rcs_key = f"rcs_settings.{device_id}"
+        sensor_key = (
+            device.object_key
+            if device.object_key.startswith("kryptonite.")
+            else f"kryptonite.{device.serial_number}"
+        )
+
+        if active:
+            payload = {
+                "active_rcs_sensors": [sensor_key],
+                "rcs_control_setting": "OVERRIDE",
+            }
+        else:
+            payload = {"active_rcs_sensors": [], "rcs_control_setting": "OFF"}
+
+        await self._async_set_generic_property(rcs_key, payload)
+
     async def async_get_camera_snapshot(self, device: NestCamera) -> bytes | None:
         """Get a snapshot from a camera."""
+        # A protobuf camera learns its image URL from the trait stream, so an
+        # empty nexus_api_http_server_url is not fatal for it.
+        if device.is_protobuf:
+            return await self._async_get_protobuf_camera_snapshot(device)
+
         if not device.nexus_api_http_server_url:
             _LOGGER.error(
                 "Cannot get snapshot for %s, nexus_api_http_server_url is missing",
@@ -2232,35 +2445,143 @@ class NestClient:
             )
             return None
 
-        if device.is_protobuf:
-            try:
-                upload_req = (
-                    nest_camera_pb2.UploadLiveImageTrait.UploadLiveImageRequest()
-                )
-                command = v1_pb2.ResourceCommand(traitLabel="upload_live_image")
-                command.command.Pack(
-                    upload_req,
-                    type_url_prefix=_NESTLABS_TYPE_URL_PREFIX,
-                )
-                await self._async_send_command(device, command)
-            except PynestException as err:
-                _LOGGER.warning("Failed to send upload_live_image command: %r", err)
-            url = device.nexus_api_http_server_url
-        else:
-            camera_uuid = device.object_key.split(".")[1]
-            url = urljoin(
-                device.nexus_api_http_server_url,
-                f"/get_image?uuid={camera_uuid}",
-            )
+        camera_uuid = device.object_key.split(".")[1]
+        url = urljoin(
+            device.nexus_api_http_server_url,
+            f"/get_image?uuid={camera_uuid}",
+        )
         _LOGGER.debug("Requesting camera snapshot from URL: %s", url)
+        return await self._async_fetch_camera_snapshot(url)
 
+    async def _async_get_protobuf_camera_snapshot(
+        self, device: NestCamera
+    ) -> bytes | None:
+        """Read the frame the last upload_live_image published.
+
+        The command is asynchronous, so the URL it produces only reaches the
+        client when the camera answers on the trait stream. Reading the device's
+        current URL straight away returns the frame of the previous request, and
+        the same URL stops answering once a newer upload replaces it.
+        """
+        for attempt in range(1, _SNAPSHOT_ATTEMPTS + 1):
+            waited_out = False
+            # Concurrent callers for the same camera share one waiter, and only
+            # the caller that created it asks the camera to upload: a second
+            # command would invalidate the URL the first one is about to get.
+            published = self._live_image_waiters.get(device.object_key)
+            joined = published is not None
+            if published is None:
+                published = asyncio.Event()
+                self._live_image_waiters[device.object_key] = published
+            try:
+                if not joined:
+                    try:
+                        await self._async_send_command(
+                            device,
+                            self._upload_live_image_command(),
+                        )
+                    except (TimeoutError, PynestException) as err:
+                        # _async_send_command already retried internally:
+                        # repeating it here would mean nine attempts and blow
+                        # past the 10 s Home Assistant allows for a camera image.
+                        _LOGGER.warning(
+                            "Failed to send upload_live_image command: %r", err
+                        )
+                        return None
+                try:
+                    await asyncio.wait_for(
+                        published.wait(), timeout=_SNAPSHOT_URL_TIMEOUT
+                    )
+                except TimeoutError:
+                    waited_out = True
+                    _LOGGER.debug(
+                        "No new live image URL for %s %s within %.0fs, using the last one",
+                        device.location,
+                        device.name,
+                        _SNAPSHOT_URL_TIMEOUT,
+                    )
+            finally:
+                # Only the owner clears the waiter: a joiner may leave earlier
+                # (a closed tab, a cancelled snapshot) and must not take the
+                # Event away from the caller that sent the command.
+                if (
+                    not joined
+                    and self._live_image_waiters.get(device.object_key) is published
+                ):
+                    self._live_image_waiters.pop(device.object_key, None)
+                    if not published.is_set():
+                        # The command failed: wake anyone waiting on this upload
+                        # instead of leaving them out the whole timeout.
+                        published.set()
+
+            url = self._live_image_urls.get(
+                device.object_key, device.nexus_api_http_server_url
+            )
+            if not url:
+                _LOGGER.error(
+                    "Cannot get snapshot for %s, no live image URL is known",
+                    device.object_key,
+                )
+                return None
+
+            _LOGGER.debug(
+                "Requesting camera snapshot from URL (attempt %d/%d): %s",
+                attempt,
+                _SNAPSHOT_ATTEMPTS,
+                url,
+            )
+            image = await self._async_fetch_camera_snapshot(
+                url, log_level=logging.DEBUG
+            )
+            if image is not None:
+                return image
+            # A wait that already burnt its timeout has spent the budget: do not
+            # add another second on top and push the request past HA's 10 s.
+            if attempt < _SNAPSHOT_ATTEMPTS and not waited_out:
+                await asyncio.sleep(_SNAPSHOT_RETRY_DELAY)
+
+        _LOGGER.warning(
+            "Camera snapshot for %s %s failed %d times, giving up for this request",
+            device.location,
+            device.name,
+            _SNAPSHOT_ATTEMPTS,
+        )
+        return None
+
+    @staticmethod
+    def _upload_live_image_command() -> v1_pb2.ResourceCommand:
+        """Build the command that asks a camera to upload a fresh frame."""
+        upload_req = nest_camera_pb2.UploadLiveImageTrait.UploadLiveImageRequest()
+        command = v1_pb2.ResourceCommand(traitLabel="upload_live_image")
+        command.command.Pack(upload_req, type_url_prefix=_NESTLABS_TYPE_URL_PREFIX)
+        return command
+
+    def _publish_live_image_url(self, resource_id: str, url: str | None) -> None:
+        """Remember a camera's new live image URL and wake whoever waits for it."""
+        if not url:
+            return
+        self._live_image_urls[resource_id] = url
+        waiter = self._live_image_waiters.pop(resource_id, None)
+        if waiter is not None:
+            waiter.set()
+
+    async def _async_fetch_camera_snapshot(
+        self, url: str, log_level: int = logging.WARNING
+    ) -> bytes | None:
+        """Fetch the image the camera serves at a snapshot URL.
+
+        The caller picks the level: a REST camera only asks once, so a failure
+        is worth a warning, while the protobuf path retries and warns once at
+        the end instead of on every attempt.
+        """
         async with self._session.get(
             url, headers=self._get_camera_headers()
         ) as response:
             if response.ok:
                 return await response.read()
-            _LOGGER.error(
-                "Failed to get camera snapshot. Status: %s, URL: %s",
+            _LOGGER.log(
+                log_level,
+                "Camera snapshot answered %s: %s",
                 response.status,
                 response.url,
             )
@@ -2383,25 +2704,12 @@ class NestClient:
             type_url_prefix=_NESTLABS_TYPE_URL_PREFIX,
         )
 
-        try:
-            resp = await self._async_send_command(device, command)
-        except NonRetryablePynestException as err:
-            # Some accounts are not authorized for the camera_observation_history
-            # trait and answer with PERMISSION_DENIED on every poll (see issue #61),
-            # with an "authentication failed" message that signing in again does
-            # not fix. This never recovers, so warn once and stop polling this camera.
-            self._protobuf_events_unauthorized.add(device.object_key)
-            _LOGGER.warning(
-                "Protobuf camera events are not available for %s %s, "
-                "no longer polling it for events: %r",
-                device.location,
-                device.name,
-                err,
-            )
-            return []
-        except PynestException as err:
-            _LOGGER.warning("Failed to fetch protobuf camera events: %r", err)
-            return []
+        # Every failure is raised as it is: this method is called from the poll
+        # loop, which refreshes the session and retries, and from the media
+        # source, which does neither. Keeping the "how many failures" state here
+        # made a failure counted by one caller decide for the other (see the
+        # review on #93), so the policy lives one level up, in the coordinator.
+        resp = await self._async_send_command(device, command)
 
         events: list[dict[str, Any]] = []
 
@@ -2456,8 +2764,6 @@ class NestClient:
                         "Protobuf camera events are not supported for legacy Nest accounts"
                     )
                     self._legacy_protobuf_events_warned = True
-                return []
-            if device.object_key in self._protobuf_events_unauthorized:
                 return []
             return await self._async_get_protobuf_camera_events(
                 device, start_time, end_time
@@ -2703,6 +3009,12 @@ class NestClient:
                 continue
 
             updates[resource_id][descriptor_full_name] = unpacked_message
+
+            # Publish only the state that won the ACCEPTED precedence above: a
+            # batch carrying ACCEPTED and then an older CONFIRMED for the same
+            # trait must not leave the stale URL behind.
+            if isinstance(unpacked_message, nest_camera_pb2.UploadLiveImageTrait):
+                self._publish_live_image_url(resource_id, unpacked_message.liveImageUrl)
 
         return updates
 
